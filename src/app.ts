@@ -1,0 +1,147 @@
+import { basicAuth } from "hono/basic-auth";
+import { cors } from "hono/cors";
+import { sign } from "hono/jwt";
+import { poweredBy } from "hono/powered-by";
+import { validator } from "hono/validator";
+
+import { coerce, minLength, object, optional, string } from "zod/v4-mini";
+
+import { FlagglyError } from "./error";
+import { createApp } from "./routes/_app";
+import { admin } from "./routes/admin";
+import { api } from "./routes/api";
+import { ui } from "./routes/ui";
+import { baseHeaderSchema } from "./schema";
+import { AppKV } from "./storage";
+
+const app = createApp();
+
+app.use(
+	poweredBy({
+		serverName: "flaggly",
+	}),
+);
+
+app.use(
+	cors({
+		origin: (_, ctx) => {
+			const incomingOrigin = ctx.req.header("Origin");
+			const allowedOrigins = ctx.env.ORIGIN.split(",");
+
+			if (!incomingOrigin) {
+				return undefined;
+			}
+
+			if (allowedOrigins.length === 1) {
+				return allowedOrigins[0];
+			}
+
+			const matchingOrigin = allowedOrigins.find(
+				(origin: string) => origin === incomingOrigin,
+			);
+
+			return matchingOrigin ?? undefined;
+		},
+		allowHeaders: ["x-app-id", "x-env-id", "authorization", "content-type"],
+	}),
+);
+
+app.use(async (c, next) => {
+	const appHeaders = baseHeaderSchema.parse({
+		app: c.req.header("x-app-id") || c.req.query("app"),
+		env: c.req.header("x-env-id") || c.req.query("env"),
+	});
+
+	const kv = new AppKV({
+		kv: c.env.FLAGGLY_KV,
+		app: appHeaders.app,
+		env: appHeaders.env,
+	});
+
+	c.set("kv", kv);
+
+	await next();
+});
+
+app.use("/app/*", (c, next) => {
+	const handler = basicAuth({
+		verifyUser: (username, password) => {
+			return username === "flaggly" && password === c.env.JWT_SECRET;
+		},
+	});
+	return handler(c, next);
+});
+
+app.route("/api", api);
+app.route("/admin", admin);
+app.route("/app", ui);
+
+app.get("/", (c) => c.redirect("/app"));
+
+const secretSchema = object({
+	secret: string().check(minLength(32)),
+	expireAt: optional(coerce.date()),
+});
+
+app.post(
+	"/__generate",
+	validator("json", (data, c) => {
+		const parsed = secretSchema.safeParse(data);
+
+		if (!parsed.success) {
+			const error = new FlagglyError(
+				"Invalid secret",
+				"INVALID_BODY",
+				parsed.error.issues,
+			);
+			return c.json(error, error.statusCode);
+		}
+
+		if (c.env.JWT_SECRET !== parsed.data.secret) {
+			const error = new FlagglyError("Invalid secret", "INVALID_BODY");
+			return c.json(error, error.statusCode);
+		}
+
+		return parsed.data;
+	}),
+	async (c) => {
+		const { secret, expireAt } = c.req.valid("json");
+		const SIX_MONTHS = 15552000;
+		const iat = Math.floor(Date.now() / 1000);
+
+		const exp = expireAt
+			? Math.floor(expireAt.getTime() / 1000)
+			: iat + SIX_MONTHS;
+
+		const baseClaims = {
+			iat,
+			exp,
+		};
+
+		const user = await sign(
+			{
+				iss: "flaggly.user",
+				...baseClaims,
+			},
+			secret,
+		);
+
+		const admin = await sign(
+			{
+				iss: "flaggly.admin",
+				...baseClaims,
+			},
+			secret,
+		);
+
+		return c.json(
+			{
+				user,
+				admin,
+			},
+			200,
+		);
+	},
+);
+
+export default app;
